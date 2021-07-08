@@ -2,13 +2,16 @@ use error_chain::error_chain;
 use imap;
 use log::{debug, trace};
 use native_tls::{self, TlsConnector, TlsStream};
-use std::{collections::HashSet, iter::FromIterator, net::TcpStream};
+use std::{collections::HashSet, convert::TryFrom, iter::FromIterator, net::TcpStream};
 
-use crate::{config::model::Account, ctx::Ctx, flag::model::Flag, msg::model::Msg};
+use crate::config::model::Account;
+use crate::ctx::Ctx;
+use crate::msg::model::Msg;
 
 error_chain! {
     links {
         Config(crate::config::model::Error, crate::config::model::ErrorKind);
+        MessageError(crate::msg::model::Error, crate::msg::model::ErrorKind);
     }
 }
 
@@ -147,11 +150,14 @@ impl<'a> ImapConnector<'a> {
                     .chain_err(|| "Could not fetch new messages enveloppe")?;
 
                 for fetch in fetches.iter() {
-                    let msg = Msg::from(fetch);
+                    let msg = Msg::try_from(fetch)?;
                     let uid = fetch.uid.ok_or_else(|| {
                         format!("Could not retrieve message {}'s UID", fetch.message)
                     })?;
-                    ctx.config.run_notify_cmd(&msg.subject, &msg.sender)?;
+
+                    let subject = msg.envelope.subject.clone().unwrap_or_default();
+                    ctx.config.run_notify_cmd(&subject, &msg.envelope.from[0])?;
+
                     debug!("notify message: {}", uid);
                     trace!("message: {:?}", msg);
 
@@ -266,25 +272,44 @@ impl<'a> ImapConnector<'a> {
         Ok(Some(fetches))
     }
 
-    pub fn read_msg(&mut self, mbox: &str, uid: &str) -> Result<Vec<u8>> {
+    // pub fn get_msg(&mut self, mbox: &str, uid: &str) -> Result<Vec<u8>> {
+    //     self.sess
+    //         .select(mbox)
+    //         .chain_err(|| format!("Could not select mailbox `{}`", mbox))?;
+    //
+    //     match self
+    //         .sess
+    //         .uid_fetch(uid, "(FLAGS BODY[])")
+    //         .chain_err(|| "Could not fetch bodies")?
+    //         .first()
+    //     {
+    //         None => Err(format!("Could not find message `{}`", uid).into()),
+    //         Some(fetch) => Ok(fetch.body().unwrap_or(&[]).to_vec()),
+    //     }
+    // }
+
+    pub fn get_msg(&mut self, mbox: &str, uid: &str) -> Result<Msg> {
         self.sess
             .select(mbox)
             .chain_err(|| format!("Could not select mailbox `{}`", mbox))?;
 
         match self
             .sess
-            .uid_fetch(uid, "(FLAGS BODY[])")
+            .uid_fetch(uid, "(FLAGS BODY[] ENVELOPE INTERNALDATE)")
             .chain_err(|| "Could not fetch bodies")?
             .first()
         {
             None => Err(format!("Could not find message `{}`", uid).into()),
-            Some(fetch) => Ok(fetch.body().unwrap_or(&[]).to_vec()),
+            Some(fetch) => Ok(Msg::try_from(fetch)?),
         }
     }
 
-    pub fn append_msg(&mut self, mbox: &str, msg: &[u8], flags: Vec<Flag>) -> Result<()> {
+    pub fn append_msg(&mut self, mbox: &str, msg: &mut Msg) -> Result<()> {
+        let body = msg.into_bytes()?;
+        let flags: HashSet<imap::types::Flag<'static>> = (*msg.flags).clone();
+
         self.sess
-            .append(mbox, msg)
+            .append(mbox, &body)
             .flags(flags)
             .finish()
             .chain_err(|| format!("Could not append message to `{}`", mbox))?;

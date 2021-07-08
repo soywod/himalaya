@@ -107,6 +107,83 @@ impl Account {
             _ => false,
         }
     }
+
+    /// This is a little helper-function like which uses the the name and email
+    /// of the account to create a valid address for the header of the envelope
+    /// of an msg.
+    ///
+    /// # Example 1: With name
+    /// Suppose the name field in the account struct *has* a value:
+    ///
+    /// ```rust
+    /// use himalaya::config::model::Account;
+    ///
+    /// fn main() {
+    ///     let account = Account {
+    ///         // we just need those two values
+    ///         name: Some(String::from("Name")),
+    ///         email: String::from("BestEmail@Ever.lol"),
+    ///         ..Account::default()
+    ///     };
+    ///
+    ///     // get the address of the account
+    ///     let address = account.get_full_address();
+    ///
+    ///     assert_eq!("Name <BestEmail@Ever.lol>".to_string(), address);
+    /// }
+    /// ```
+    ///
+    /// # Example 2: Without name
+    /// Suppose the name field in the account-struct *hasn't* a value:
+    ///
+    /// ```rust
+    /// use himalaya::config::model::Account;
+    ///
+    /// fn main() {
+    ///     let account = Account {
+    ///         // we just need those two values
+    ///         name: None,
+    ///         email: String::from("BestEmail@Ever.lol"),
+    ///         ..Account::default()
+    ///     };
+    ///
+    ///     // get the address of the account
+    ///     let address = account.get_full_address();
+    ///
+    ///     assert_eq!("BestEmail@Ever.lol".to_string(), address);
+    /// }
+    /// ```
+    pub fn get_full_address(&self) -> String {
+        if let Some(name) = &self.name {
+            format!("{} <{}>", name, self.email)
+        } else {
+            format!("{}", self.email)
+        }
+    }
+
+    pub fn new(name: Option<&str>, email_addr: &str) -> Self {
+        Self {
+            name: name.and_then(|name| Some(name.to_string())),
+            downloads_dir: Some(PathBuf::from(r"/tmp")),
+            signature: Some(String::from("Account Signature")),
+            default_page_size: Some(42),
+            default: Some(true),
+            email: email_addr.into(),
+            watch_cmds: Some(vec!["mbsync".to_string(), "-a".to_string()]),
+            imap_host: String::from("localhost"),
+            imap_port: 3993,
+            imap_starttls: Some(false),
+            imap_insecure: Some(true),
+            imap_login: email_addr.into(),
+            imap_passwd_cmd: String::from("echo 'password'"),
+            smtp_host: String::from("localhost"),
+            smtp_port: 3465,
+            smtp_starttls: Some(false),
+            smtp_insecure: Some(true),
+            smtp_login: email_addr.into(),
+            smtp_passwd_cmd: String::from("echo 'password'"),
+        }
+    }
 }
 
 impl Default for Account {

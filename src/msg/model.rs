@@ -1,664 +1,1346 @@
-use error_chain::error_chain;
-use lettre;
-use log::warn;
-use mailparse::{self, MailHeaderMap};
-use rfc2047_decoder;
-use serde::{
-    ser::{self, SerializeStruct, Serializer},
-    Serialize,
-};
-use std::{borrow::Cow, fmt, fs, path::PathBuf, result};
-use tree_magic;
-use unicode_width::UnicodeWidthStr;
-use uuid::Uuid;
+use super::attachment::Attachment;
+use super::body::Body;
+use super::envelope::Envelope;
+
+use log::debug;
+
+use imap::types::{Fetch, Flag, ZeroCopy};
+
+use mailparse;
 
 use crate::{
-    config::model::{Account, Config},
-    flag::model::{Flag, Flags},
+    config::model::Account,
+    flag::model::Flags,
     table::{Cell, Row, Table},
 };
 
-error_chain! {
+#[cfg(not(test))]
+use crate::input;
+
+use serde::Serialize;
+
+use lettre::message::{Attachment as lettre_Attachment, Mailbox, Message, MultiPart, SinglePart};
+
+use std::convert::{From, TryFrom};
+use std::fmt;
+
+use colorful::Colorful;
+
+error_chain::error_chain! {
+    errors {
+        // An error appeared, when it tried to parse the body of the mail!
+        ParseBody (err: String) {
+            description("Couldn't get the body of the parsed mail."),
+            display("Couldn't get the body of the parsed mail: {}", err),
+        }
+
+        /// Is mainly used in the "to_sendable_msg" function
+        Header(error_msg: String, header_name: &'static str, header_input: String) {
+
+            description("An error happened, when trying to parse a header-field."),
+            display(concat![
+                    "[{}] {}\n",
+                    "Header-Field-Name: '{}'\n",
+                    "The word which let this error occur: '{}'"],
+                    "Error".red(),
+                    error_msg.clone().light_red(),
+                    header_name.light_blue(),
+                    header_input.clone().light_cyan()),
+        }
+    }
+
+    links {
+        Attachment(super::attachment::Error, super::attachment::ErrorKind);
+        Envelope(super::envelope::Error, super::envelope::ErrorKind);
+        Input(crate::input::Error, crate::input::ErrorKind);
+    }
+
     foreign_links {
-        Mailparse(mailparse::MailParseError);
+        MailParse(mailparse::MailParseError);
         Lettre(lettre::error::Error);
+        LettreAddress(lettre::address::AddressError);
+        FromUtf8Error(std::string::FromUtf8Error);
     }
 }
 
-// Template
+// =========
+// Msg
+// =========
+/// This struct represents a whole mail/msg with its attachments, body-content
+/// and its envelope.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone)]
+pub struct Msg {
+    /// All added attachments are listed in this vector.
+    pub attachments: Vec<Attachment>,
 
-#[derive(Debug)]
-pub struct Tpl(String);
+    /// The flags of this mail.
+    pub flags: Flags,
 
-impl fmt::Display for Tpl {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
+    /// All information of the envelope (sender, from, to and so on)
+    // envelope: HashMap<HeaderName, Vec<String>>,
+    pub envelope: Envelope,
+
+    /// This variable stores the body of the msg.
+    pub body: Body,
+
+    /// The UID of the mail. It's only set from the server!
+    uid: Option<u32>,
+
+    /// The origination date field. Read [the RFC here] here for more
+    /// information.
+    ///
+    /// [the RFC here]:
+    /// https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.1
+    date: Option<String>,
+
+    /// The msg but in raw.
+    raw: Vec<u8>,
+}
+
+impl Msg {
+    /// Creates a completely new msg where two header fields are set:
+    /// - [`from`]
+    /// - and [`signature`]
+    ///
+    /// [`from`]: struct.Envelope.html#structfield.from
+    /// [`signature`]: struct.Envelope.html#structfield.signature
+    ///
+    /// # Example
+    ///
+    /// <details>
+    ///
+    /// ```
+    /// # use himalaya::msg::model::Msg;
+    /// # use himalaya::msg::envelope::Envelope;
+    /// # use himalaya::config::model::Account;
+    /// # fn main() {
+    /// // -------------
+    /// // Accounts
+    /// // -------------
+    /// let account1 = Account::new(Some("Soywod"), "clement.douin@posteo.net");
+    /// let account2 = Account::new(None, "tornax07@gmail.com");
+    ///
+    /// // ---------------------
+    /// // Creating message
+    /// // ---------------------
+    /// let msg1 = Msg::new(&account1);
+    /// let msg2 = Msg::new(&account2);
+    ///
+    /// let expected_envelope1 = Envelope {
+    ///     from: vec![String::from("Soywod <clement.douin@posteo.net>")],
+    ///     // the signature of the account is stored as well
+    ///     signature: Some(String::from("Account Signature")),
+    ///     .. Envelope::default()
+    /// };
+    ///
+    /// let expected_envelope2 = Envelope {
+    ///     from: vec![String::from("tornax07@gmail.com")],
+    ///     signature: Some(String::from("Account Signature")),
+    ///     .. Envelope::default()
+    /// };
+    ///
+    /// assert_eq!(msg1.envelope, expected_envelope1);
+    /// assert_eq!(msg2.envelope, expected_envelope2);
+    /// # }
+    /// ```
+    ///
+    /// </details>
+    ///
+    pub fn new(account: &Account) -> Self {
+        Self::new_with_envelope(account, Envelope::default())
     }
-}
 
-impl Serialize for Tpl {
-    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
-    where
-        S: ser::Serializer,
-    {
-        let mut state = serializer.serialize_struct("Tpl", 1)?;
-        state.serialize_field("template", &self.0)?;
-        state.end()
-    }
-}
+    /// This function does the same as [`Msg::new`] but you can apply a custom
+    /// [`envelope`] when calling the function instead of using the default one
+    /// from the [`Msg::new`] function.
+    ///
+    /// [`Msg::new`]: struct.Msg.html#method.new
+    /// [`envelope`]: struct.Envelope.html
+    pub fn new_with_envelope(account: &Account, mut envelope: Envelope) -> Self {
+        // --------------------------
+        // Envelope credentials
+        // --------------------------
+        if envelope.from.is_empty() {
+            envelope.from = vec![account.get_full_address()];
+        }
 
-// Attachments
+        if let None = envelope.signature {
+            envelope.signature = account.signature.clone();
+        }
+        // ---------------------
+        // Body credentials
+        // ---------------------
+        let body = Body::from(envelope.signature.clone().unwrap_or_default());
 
-#[derive(Debug)]
-pub struct Attachment {
-    pub filename: String,
-    pub raw: Vec<u8>,
-}
-
-impl<'a> Attachment {
-    // TODO: put in common with ReadableMsg
-    pub fn from_part(part: &'a mailparse::ParsedMail) -> Self {
         Self {
-            filename: part
-                .get_content_disposition()
-                .params
-                .get("filename")
-                .unwrap_or(&Uuid::new_v4().to_simple().to_string())
-                .to_owned(),
-            raw: part.get_body_raw().unwrap_or_default(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Attachments(pub Vec<Attachment>);
-
-impl<'a> Attachments {
-    fn extract_from_part(&'a mut self, part: &'a mailparse::ParsedMail) {
-        if part.subparts.is_empty() {
-            let ctype = part
-                .get_headers()
-                .get_first_value("content-type")
-                .unwrap_or_default();
-            if !ctype.starts_with("text") {
-                self.0.push(Attachment::from_part(part));
-            }
-        } else {
-            part.subparts
-                .iter()
-                .for_each(|part| self.extract_from_part(part));
-        }
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let msg = mailparse::parse_mail(bytes)?;
-        let mut attachments = Self(vec![]);
-        attachments.extract_from_part(&msg);
-        Ok(attachments)
-    }
-}
-
-// Readable message
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadableMsg {
-    pub content: String,
-    #[serde(serialize_with = "bool_to_int")]
-    pub has_attachment: bool,
-}
-
-impl fmt::Display for ReadableMsg {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{}", self.content)
-    }
-}
-
-impl<'a> ReadableMsg {
-    fn flatten_parts(part: &'a mailparse::ParsedMail) -> Vec<&'a mailparse::ParsedMail<'a>> {
-        if part.subparts.is_empty() {
-            vec![part]
-        } else {
-            part.subparts
-                .iter()
-                .flat_map(Self::flatten_parts)
-                .collect::<Vec<_>>()
-        }
-    }
-
-    pub fn from_bytes(mime: &str, bytes: &[u8]) -> Result<Self> {
-        let msg = mailparse::parse_mail(bytes)?;
-        let (text_part, html_part, has_attachment) = Self::flatten_parts(&msg).into_iter().fold(
-            (None, None, false),
-            |(mut text_part, mut html_part, mut has_attachment), part| {
-                let ctype = part
-                    .get_headers()
-                    .get_first_value("content-type")
-                    .unwrap_or_default();
-
-                if text_part.is_none() && ctype.starts_with("text/plain") {
-                    text_part = part.get_body().ok();
-                } else {
-                    if html_part.is_none() && ctype.starts_with("text/html") {
-                        html_part = part.get_body().ok();
-                    } else {
-                        has_attachment = true
-                    };
-                };
-
-                (text_part, html_part, has_attachment)
-            },
-        );
-
-        let content = if mime == "text/plain" {
-            text_part.or(html_part).unwrap_or_default()
-        } else {
-            html_part.or(text_part).unwrap_or_default()
-        };
-
-        Ok(Self {
-            content,
-            has_attachment,
-        })
-    }
-}
-
-// Message
-
-#[derive(Debug)]
-pub struct Msg<'m> {
-    pub uid: u32,
-    pub flags: Flags<'m>,
-    pub subject: String,
-    pub sender: String,
-    pub date: String,
-    pub attachments: Vec<String>,
-    pub raw: Vec<u8>,
-}
-
-impl<'a> Serialize for Msg<'a> {
-    fn serialize<T>(&self, serializer: T) -> result::Result<T::Ok, T::Error>
-    where
-        T: ser::Serializer,
-    {
-        let mut state = serializer.serialize_struct("Msg", 7)?;
-        state.serialize_field("uid", &self.uid)?;
-        state.serialize_field("flags", &self.flags)?;
-        state.serialize_field("subject", &self.subject)?;
-        state.serialize_field(
-            "subject_len",
-            &UnicodeWidthStr::width(self.subject.as_str()),
-        )?;
-        state.serialize_field("sender", &self.sender)?;
-        state.serialize_field("sender_len", &UnicodeWidthStr::width(self.sender.as_str()))?;
-        state.serialize_field("date", &self.date)?;
-        state.end()
-    }
-}
-
-impl<'m> From<Vec<u8>> for Msg<'m> {
-    fn from(raw: Vec<u8>) -> Self {
-        Self {
-            uid: 0,
+            attachments: Vec::new(),
             flags: Flags::new(&[]),
-            subject: String::from(""),
-            sender: String::from(""),
-            date: String::from(""),
-            attachments: vec![],
-            raw,
+            envelope,
+            body,
+            // since the uid is set from the server, we will just set it to None
+            uid: None,
+            date: None,
+            raw: Vec::new(),
         }
     }
-}
 
-impl<'m> From<String> for Msg<'m> {
-    fn from(raw: String) -> Self {
-        Self::from(raw.as_bytes().to_vec())
-    }
-}
+    /// Converts the message into a Reply message. It'll set the headers
+    /// differently depending on the value of `reply_all`.
+    ///
+    /// # Changes
+    /// The value on the left side, represents the header *after* the function
+    /// call, while the value on the right side shows the data *before* the
+    /// function call. So if we pick up the first example of `reply_all =
+    /// false`, then we can see, that the value of `ReplyTo:` is moved into the
+    /// `To:` header field in this function call.
+    ///
+    /// - `reply_all = false`:
+    ///     - `To:` = `ReplyTo:` otherwise from `From:`
+    ///     - attachments => cleared
+    ///     - `From:` = Emailaddress of the current user account
+    ///     - `Subject:` = "Re:" + `Subject`
+    ///     - `in_reply_to` = Old Message ID
+    ///     - `Cc:` = cleared
+    ///
+    /// - `reply_all = true`:
+    ///     - `To:` = `ReplyTo:` + Addresses in `To:`
+    ///     - `Cc:` = All CC-Addresses
+    ///     - The rest: Same as in `reply_all = false`
+    ///
+    /// It'll add for each line in the body the `>` character in the beginning
+    /// of each line.
+    ///
+    /// # Example
+    /// [Here] you can see an example how a discussion with replies could look
+    /// like.
+    ///
+    /// [Here]: https://www.rfc-editor.org/rfc/rfc5322.html#page-46
+    pub fn change_to_reply(&mut self, account: &Account, reply_all: bool) -> Result<()> {
+        // ------------------
+        // Adjust header
+        // ------------------
+        // Pick up the current subject of the mail
+        let old_subject = self.envelope.subject.clone().unwrap_or(String::new());
 
-impl<'m> From<&'m imap::types::Fetch> for Msg<'m> {
-    fn from(fetch: &'m imap::types::Fetch) -> Self {
-        match fetch.envelope() {
-            None => Self::from(fetch.body().unwrap_or_default().to_vec()),
-            Some(envelope) => Self {
-                uid: fetch.uid.unwrap_or_default(),
-                flags: Flags::new(fetch.flags()),
-                subject: envelope
-                    .subject
-                    .as_ref()
-                    .and_then(|subj| rfc2047_decoder::decode(subj).ok())
-                    .unwrap_or_default(),
-                sender: envelope
-                    .from
-                    .as_ref()
-                    .and_then(|addrs| addrs.first())
-                    .and_then(|addr| {
-                        addr.name
-                            .as_ref()
-                            .and_then(|name| rfc2047_decoder::decode(name).ok())
-                            .or_else(|| {
-                                let mbox = addr
-                                    .mailbox
-                                    .as_ref()
-                                    .and_then(|mbox| String::from_utf8(mbox.to_vec()).ok())
-                                    .unwrap_or(String::from("unknown"));
-                                let host = addr
-                                    .host
-                                    .as_ref()
-                                    .and_then(|host| String::from_utf8(host.to_vec()).ok())
-                                    .unwrap_or(String::from("unknown"));
-                                Some(format!("{}@{}", mbox, host))
-                            })
-                    })
-                    .unwrap_or(String::from("unknown")),
-                date: fetch
-                    .internal_date()
-                    .map(|date| date.naive_local().to_string())
-                    .unwrap_or_default(),
-                attachments: vec![],
-                raw: fetch.body().unwrap_or_default().to_vec(),
-            },
-        }
-    }
-}
+        // The new fields
+        let mut to: Vec<String> = Vec::new();
+        let mut cc = None;
 
-impl<'m> Msg<'m> {
-    pub fn parse(&'m self) -> Result<mailparse::ParsedMail<'m>> {
-        Ok(mailparse::parse_mail(&self.raw)?)
-    }
+        if reply_all {
+            let email_addr: lettre::Address = account.email.parse()?;
 
-    pub fn to_vec(&self) -> Result<Vec<u8>> {
-        let parsed = self.parse()?;
-        let headers = parsed.get_headers().get_raw_bytes().to_vec();
-        let sep = "\r\n".as_bytes().to_vec();
-        let body = parsed.get_body()?.as_bytes().to_vec();
+            for addr in self.envelope.to.iter() {
+                let addr_parsed: Mailbox = addr.parse()?;
 
-        Ok(vec![headers, sep, body].concat())
-    }
-
-    pub fn to_sendable_msg(&self) -> Result<lettre::Message> {
-        use lettre::message::{
-            header::*,
-            {Body, Message, MultiPart, SinglePart},
-        };
-
-        let mut encoding = ContentTransferEncoding::Base64;
-        let parsed = self.parse()?;
-        let msg_builder = parsed.headers.iter().fold(Message::builder(), |msg, h| {
-            let value = String::from_utf8(h.get_value_raw().to_vec())
-                .unwrap()
-                .replace("\r", "");
-
-            match h.get_key().to_lowercase().as_str() {
-                "in-reply-to" => msg.in_reply_to(value.parse().unwrap()),
-                "from" => match value.parse() {
-                    Ok(addr) => msg.from(addr),
-                    Err(_) => msg,
-                },
-                "to" => value
-                    .split(",")
-                    .fold(msg, |msg, addr| match addr.trim().parse() {
-                        Ok(addr) => msg.to(addr),
-                        Err(_) => msg,
-                    }),
-                "cc" => value
-                    .split(",")
-                    .fold(msg, |msg, addr| match addr.trim().parse() {
-                        Ok(addr) => msg.cc(addr),
-                        Err(_) => msg,
-                    }),
-                "bcc" => value
-                    .split(",")
-                    .fold(msg, |msg, addr| match addr.trim().parse() {
-                        Ok(addr) => msg.bcc(addr),
-                        Err(_) => msg,
-                    }),
-                "subject" => msg.subject(value),
-                "content-transfer-encoding" => {
-                    match value.to_lowercase().as_str() {
-                        "8bit" => encoding = ContentTransferEncoding::EightBit,
-                        "7bit" => encoding = ContentTransferEncoding::SevenBit,
-                        "quoted-printable" => encoding = ContentTransferEncoding::QuotedPrintable,
-                        "base64" => encoding = ContentTransferEncoding::Base64,
-                        _ => warn!("unsupported encoding, default to base64"),
-                    }
-                    msg
+                // we don't want to receive the mail which we have just sent,
+                // don't we?
+                if addr_parsed.email != email_addr {
+                    to.push(addr.to_string());
                 }
-                _ => msg,
             }
-        });
 
-        let text_part = SinglePart::builder()
-            .header(ContentType::TEXT_PLAIN)
-            .header(encoding)
-            .body(parsed.get_body_raw()?);
+            // Also use the addresses in the "Cc:" field
+            cc = self.envelope.cc.clone();
+        }
 
-        let msg = if self.attachments.is_empty() {
-            msg_builder.singlepart(text_part)
+        // Now add the addresses in the `Reply-To:` Field or from the `From:`
+        // field.
+        if let Some(reply_to) = &self.envelope.reply_to {
+            to.append(&mut reply_to.clone());
         } else {
-            let mut parts = MultiPart::mixed().singlepart(text_part);
-
-            for attachment in &self.attachments {
-                let attachment_name = PathBuf::from(attachment);
-                let attachment_name = attachment_name
-                    .file_name()
-                    .map(|fname| fname.to_string_lossy())
-                    .unwrap_or(Cow::from(Uuid::new_v4().to_string()));
-                let attachment_content = fs::read(attachment)
-                    .chain_err(|| format!("Could not read attachment `{}`", attachment))?;
-                let attachment_ctype = tree_magic::from_u8(&attachment_content);
-
-                parts = parts.singlepart(
-                    SinglePart::builder()
-                        .content_type(attachment_ctype.parse().chain_err(|| {
-                            format!("Could not parse content type `{}`", attachment_ctype)
-                        })?)
-                        .header(ContentDisposition::attachment(&attachment_name))
-                        .body(Body::new(attachment_content)),
-                );
-            }
-
-            msg_builder.multipart(parts)
-        }?;
-
-        Ok(msg)
-    }
-
-    pub fn extract_text_bodies_into(
-        part: &mailparse::ParsedMail,
-        mime: &str,
-        parts: &mut Vec<String>,
-    ) {
-        match part.subparts.len() {
-            0 => {
-                let content_type = part
-                    .get_headers()
-                    .get_first_value("content-type")
-                    .unwrap_or_default();
-
-                if content_type.starts_with(mime) {
-                    parts.push(part.get_body().unwrap_or_default())
-                }
-            }
-            _ => {
-                part.subparts
-                    .iter()
-                    .for_each(|part| Self::extract_text_bodies_into(part, mime, parts));
-            }
-        }
-    }
-
-    fn extract_text_bodies(&self, mime: &str) -> Result<Vec<String>> {
-        let mut parts = vec![];
-        Self::extract_text_bodies_into(&self.parse()?, mime, &mut parts);
-        Ok(parts)
-    }
-
-    pub fn text_bodies(&self, mime: &str) -> Result<String> {
-        let text_bodies = self.extract_text_bodies(mime)?;
-        Ok(text_bodies.join("\r\n"))
-    }
-
-    pub fn build_new_tpl(config: &Config, account: &Account) -> Result<Tpl> {
-        let msg_spec = MsgSpec {
-            in_reply_to: None,
-            to: None,
-            cc: None,
-            subject: None,
-            default_content: None,
-        };
-        Msg::build_tpl(config, account, msg_spec)
-    }
-
-    pub fn build_reply_tpl(&self, config: &Config, account: &Account) -> Result<Tpl> {
-        let msg = &self.parse()?;
-        let headers = msg.get_headers();
-        let to = headers
-            .get_first_value("reply-to")
-            .or(headers.get_first_value("from"));
-        let to = match to {
-            Some(t) => Some(vec![t]),
-            None => None,
+            // if the "Reply-To" wasn't set from the sender, then we're just
+            // replying to the addresses in the "From:" field
+            to.append(&mut self.envelope.from.clone());
         };
 
-        let thread = self // Original msg prepend with ">"
-            .text_bodies("text/plain")?
-            .replace("\r", "")
-            .split("\n")
-            .map(|line| format!(">{}", line))
-            .collect::<Vec<String>>();
+        let message_id = self.envelope.message_id.clone().unwrap_or(String::new());
 
-        let msg_spec = MsgSpec {
-            in_reply_to: headers.get_first_value("message-id"),
+        let new_envelope = Envelope {
+            from: vec![account.get_full_address()],
             to,
-            cc: None,
-            subject: headers.get_first_value("subject"),
-            default_content: Some(thread),
-        };
-        Msg::build_tpl(config, account, msg_spec)
-    }
-
-    pub fn build_reply_all_tpl(&self, config: &Config, account: &Account) -> Result<Tpl> {
-        let msg = &self.parse()?;
-        let headers = msg.get_headers();
-
-        // "To" header
-        // All addresses coming from original "To" …
-        let email: lettre::Address = account.email.parse().unwrap();
-        let to = headers
-            .get_all_values("to")
-            .iter()
-            .flat_map(|addrs| addrs.split(","))
-            .fold(vec![], |mut mboxes, addr| {
-                match addr.trim().parse::<lettre::message::Mailbox>() {
-                    Err(_) => mboxes,
-                    Ok(mbox) => {
-                        // … except current user's one (from config) …
-                        if mbox.email != email {
-                            mboxes.push(mbox.to_string());
-                        }
-                        mboxes
-                    }
-                }
-            });
-        // … and the ones coming from either "Reply-To" or "From"
-        let reply_to = headers
-            .get_all_values("reply-to")
-            .iter()
-            .flat_map(|addrs| addrs.split(","))
-            .map(|addr| addr.trim().to_string())
-            .collect::<Vec<String>>();
-        let reply_to = if reply_to.is_empty() {
-            headers
-                .get_all_values("from")
-                .iter()
-                .flat_map(|addrs| addrs.split(","))
-                .map(|addr| addr.trim().to_string())
-                .collect::<Vec<String>>()
-        } else {
-            reply_to
-        };
-
-        // "Cc" header
-        let cc = Some(
-            headers
-                .get_all_values("cc")
-                .iter()
-                .flat_map(|addrs| addrs.split(","))
-                .map(|addr| addr.trim().to_string())
-                .collect::<Vec<String>>(),
-        );
-
-        // Original msg prepend with ">"
-        let thread = self
-            .text_bodies("text/plain")?
-            .split("\r\n")
-            .map(|line| format!(">{}", line))
-            .collect::<Vec<String>>();
-
-        let msg_spec = MsgSpec {
-            in_reply_to: headers.get_first_value("message-id"),
             cc,
-            to: Some(vec![reply_to, to].concat()),
-            subject: headers.get_first_value("subject"),
-            default_content: Some(thread),
+            subject: Some(format!("Re: {}", old_subject)),
+            in_reply_to: Some(message_id),
+            // and clear the rest of the fields
+            ..Envelope::default()
         };
-        Msg::build_tpl(config, account, msg_spec)
+
+        self.envelope = new_envelope;
+
+        // remove the attachments
+        self.attachments.clear();
+
+        // -------------------------
+        // Prepare body of mail
+        // -------------------------
+        // comment "out" the body of the mail, by adding the `>` characters to
+        // each line which includes a string.
+        let new_body: String = self
+            .body
+            .clone()
+            .split('\n')
+            .map(|line| format!("> {}\n", line))
+            .collect::<Vec<String>>()
+            .concat();
+
+        // now apply our new body
+        self.body = Body::from(new_body);
+
+        Ok(())
     }
 
-    pub fn build_forward_tpl(&self, config: &Config, account: &Account) -> Result<Tpl> {
-        let msg = &self.parse()?;
-        let headers = msg.get_headers();
+    /// Changes the msg/mail to a forwarding msg/mail.
+    ///
+    /// # Changes
+    /// Calling this function will change apply the following to the current
+    /// message:
+    ///
+    /// - `Subject:`: `"Fwd: "` will be added in front of the "old" subject
+    /// - `"---------- Forwarded Message ----------"` will be added on top of
+    ///     the body.
+    ///
+    /// # Example
+    /// ```text
+    /// Subject: Test subject
+    /// ...
+    ///
+    /// Hi,
+    /// I use Himalaya
+    ///
+    /// Sincerely
+    /// ```
+    ///
+    /// will be changed to
+    ///
+    /// ```text
+    /// Subject: Fwd: Test subject
+    /// Sender: <Your@address>
+    /// ...
+    ///
+    /// > Hi,
+    /// > I use Himalaya
+    /// >
+    /// > Sincereley
+    /// ```
+    ///
+    pub fn change_to_forwarding(&mut self, account: &Account) {
+        // -----------
+        // Header
+        // -----------
+        let old_subject = self.envelope.subject.clone().unwrap_or(String::new());
 
-        let subject = format!(
-            "Fwd: {}",
-            headers
-                .get_first_value("subject")
-                .unwrap_or_else(String::new)
-        );
-        let original_msg = vec![
-            "-------- Forwarded Message --------".to_string(),
-            self.text_bodies("text/plain")?,
-        ];
-
-        let msg_spec = MsgSpec {
-            in_reply_to: None,
-            cc: None,
-            to: None,
-            subject: Some(subject),
-            default_content: Some(original_msg),
+        self.envelope = Envelope {
+            subject: Some(format!("Fwd: {}", old_subject)),
+            sender: Some(account.get_full_address()),
+            // and use the rest of the headers
+            ..self.envelope.clone()
         };
-        Msg::build_tpl(config, account, msg_spec)
-    }
 
-    fn add_from_header(tpl: &mut Vec<String>, from: Option<String>) {
-        tpl.push(format!("From: {}", from.unwrap_or_else(String::new)));
-    }
-
-    fn add_in_reply_to_header(tpl: &mut Vec<String>, in_reply_to: Option<String>) {
-        if let Some(r) = in_reply_to {
-            tpl.push(format!("In-Reply-To: {}", r));
-        }
-    }
-
-    fn add_cc_header(tpl: &mut Vec<String>, cc: Option<Vec<String>>) {
-        if let Some(c) = cc {
-            tpl.push(format!("Cc: {}", c.join(", ")));
-        }
-    }
-
-    fn add_to_header(tpl: &mut Vec<String>, to: Option<Vec<String>>) {
-        tpl.push(format!(
-            "To: {}",
-            match to {
-                Some(t) => {
-                    t.join(", ")
-                }
-                None => {
-                    String::new()
-                }
-            }
+        // ---------
+        // Body
+        // ---------
+        // apply a line which should indicate where the forwarded message begins
+        self.body = Body::from(format!(
+            "\n---------- Forwarded Message ----------\n{}",
+            &self.body,
         ));
     }
 
-    fn add_subject_header(tpl: &mut Vec<String>, subject: Option<String>) {
-        tpl.push(format!("Subject: {}", subject.unwrap_or_else(String::new)));
+    /// Returns the bytes of the *sendable message* of the struct!
+    pub fn into_bytes(&mut self) -> Result<Vec<u8>> {
+        // parse the whole mail first
+        let parsed = self.to_sendable_msg()?;
+
+        return Ok(parsed.formatted());
     }
 
-    fn add_content(tpl: &mut Vec<String>, content: Option<Vec<String>>) {
-        if let Some(c) = content {
-            tpl.push(String::new()); // Separator between headers and body
-            tpl.extend(c);
+    /// Let the user edit the body of the mail.
+    ///
+    /// It'll enter the headers of the envelope into the draft-file *if they're
+    /// not [`None`]!*.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use himalaya::msg::model::Msg;
+    /// use himalaya::config::model::Account;
+    ///
+    /// fn main() {
+    ///     let account = Account::new(Some("Name"), "some@mail.asdf");
+    ///     let mut msg = Msg::new(&account);
+    ///
+    ///     // In this case, only the header fields "From:" and "To:" are gonna
+    ///     // be editable, because the other envelope fields are set to "None"
+    ///     // per default!
+    ///     msg.edit_body().unwrap();
+    /// }
+    /// ```
+    ///
+    /// Now enable some headers:
+    ///
+    /// ```no_run
+    /// use himalaya::msg::{model::Msg, envelope::Envelope};
+    /// use himalaya::config::model::Account;
+    ///
+    /// fn main() {
+    ///     let account = Account::new(Some("Name"), "some@mail.asdf");
+    ///     let mut msg = Msg::new_with_envelope(
+    ///         &account,
+    ///         Envelope {
+    ///             bcc: Some(Vec::new()),
+    ///             cc: Some(Vec::new()),
+    ///             .. Envelope::default()
+    ///         });
+    ///
+    ///     // The "Bcc:" and "Cc:" header fields are gonna be editable as well
+    ///     msg.edit_body().unwrap();
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// In generel an error should appear if
+    /// - The draft or changes couldn't be saved
+    /// - The changed mail can't be parsed! (You wrote some things wrong...)
+    pub fn edit_body(&mut self) -> Result<()> {
+        // First of all, we need to create our template for the user. This
+        // means, that the header needs to be added as well!
+        let body = format!("{}\n{}", self.envelope.get_header_as_string(), self.body);
+
+        // let's change the body! We don't let this line compile, if we're doing
+        // tests, because we just need to look, if the headers are set
+        // correctly
+        #[cfg(not(test))]
+        let body = input::open_editor_with_tpl(body.as_bytes())?;
+
+        // now we have to split whole mail into their headers and the body
+        self.parse_from_str(&body)?;
+
+        Ok(())
+    }
+
+    /// Read the string of the argument `content` and store it's values into the
+    /// struct. It stores the envelope-fields and the body of the mail.
+    ///
+    /// # Example
+    /// ```
+    /// use himalaya::msg::model::Msg;
+    /// use himalaya::config::model::Account;
+    ///
+    /// fn main() {
+    ///     let content = concat![
+    ///         "Subject: Himalaya is nice\n",
+    ///         "To: Soywod <clement.douin@posteo.net>\n",
+    ///         "From: TornaxO7 <tornax07@gmail.com>\n",
+    ///         "Bcc: third_person@mail.com,rofl@yeet.com\n",
+    ///         "\n",
+    ///         "You should use himalaya, it's a nice program :D\n",
+    ///         "\n",
+    ///         "Sincereley\n",
+    ///     ];
+    ///
+    ///     let account = Account::new(Some("Username"), "some@mail.com");
+    ///
+    ///     // create the message
+    ///     let mut msg = Msg::new(&account);
+    ///
+    ///     // store the information given by the `content` variable which
+    ///     // represents our current mail/msg
+    ///     msg.parse_from_str(content);
+    /// }
+    /// ```
+    pub fn parse_from_str(&mut self, content: &str) -> Result<()> {
+        let parsed = mailparse::parse_mail(content.as_bytes())
+            .chain_err(|| format!("How the message looks like currently:\n{}", self))?;
+
+        self.envelope = Envelope::from(&parsed);
+
+        if let Ok(body) = parsed.get_body() {
+            self.body = Body::from(body);
+        }
+
+        Ok(())
+    }
+
+    /// Add an attachment to the mail from the local machine by the given path.
+    ///
+    /// # Example
+    /// ```
+    /// use himalaya::config::model::Account;
+    /// use himalaya::msg::model::Msg;
+    /// use himalaya::msg::envelope::Envelope;
+    ///
+    /// fn main( ) {
+    ///     let account = Account::new(Some("Name"), "address@mail.com");
+    ///     let mut msg = Msg::new(&account);
+    ///
+    ///     // suppose we have a Screenshot saved in our home directory
+    ///     msg.add_attachment("~/Screenshot.png");
+    /// }
+    /// ```
+    ///
+    /// TODO: Error handling
+    pub fn add_attachment(&mut self, path: &str) {
+        if let Ok(new_attachment) = Attachment::try_from(path) {
+            self.attachments.push(new_attachment);
         }
     }
 
-    fn add_signature(tpl: &mut Vec<String>, config: &Config, account: &Account) {
-        if let Some(sig) = config.signature(&account) {
-            tpl.push(String::new());
-            for line in sig.split("\n") {
-                tpl.push(line.to_string());
+    /// This function will use the information of the `Msg` struct and creates
+    /// a sendable mail/msg with it. It uses the `Msg.envelope` and
+    /// `Msg.attachments` fields for that.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use himalaya::config::model::Account;
+    /// use himalaya::smtp;
+    ///
+    /// use himalaya::msg::{
+    ///     model::Msg,
+    ///     envelope::Envelope,
+    ///     body::Body,
+    /// };
+    ///
+    /// use himalaya::imap::model::ImapConnector;
+    ///
+    /// use imap::types::Flag;
+    ///
+    /// fn main() {
+    ///     let account = Account::new(Some("Name"), "name@mail.net");
+    ///     let mut imap_conn = ImapConnector::new(&account).unwrap();
+    ///     let mut msg = Msg::new_with_envelope(
+    ///         &account,
+    ///         Envelope {
+    ///             to: vec!["someone <mail@address.net>".to_string()],
+    ///             .. Envelope::default()
+    ///         }
+    ///     );
+    ///
+    ///     msg.body = Body::from("A little text.");
+    ///     let sendable_msg = msg.to_sendable_msg().unwrap();
+    ///
+    ///     // now send the msg. Hint: Do the appropriate error handling here!
+    ///     smtp::send(&account, &sendable_msg).unwrap();
+    ///
+    ///     // also say to the server of the account user, that we've just sent
+    ///     // new message
+    ///     msg.flags.insert(Flag::Seen);
+    ///     imap_conn.append_msg("Sent", &mut msg).unwrap();
+    ///
+    ///     imap_conn.logout();
+    /// }
+    /// ```
+    pub fn to_sendable_msg(&mut self) -> Result<Message> {
+        // ===================
+        // Header of Msg
+        // ===================
+        // This variable will hold all information of our mail
+        let mut msg = Message::builder();
+
+        // ---------------------
+        // Must-have-fields
+        // ---------------------
+        // add "from"
+        for mailaddress in &self.envelope.from {
+            msg = msg.from(match mailaddress.parse() {
+                Ok(from) => from,
+                Err(err) => {
+                    return Err(
+                        ErrorKind::Header(err.to_string(), "From", mailaddress.to_string()).into(),
+                    )
+                }
+            });
+        }
+
+        // add "to"
+        for mailaddress in &self.envelope.to {
+            msg = msg.to(match mailaddress.parse() {
+                Ok(to) => to,
+                Err(err) => {
+                    return Err(
+                        ErrorKind::Header(err.to_string(), "To", mailaddress.to_string()).into(),
+                    )
+                }
+            });
+        }
+
+        // --------------------
+        // Optional fields
+        // --------------------
+        // add "bcc"
+        if let Some(bcc) = &self.envelope.bcc {
+            for mailaddress in bcc {
+                msg = msg.bcc(match mailaddress.parse() {
+                    Ok(bcc) => bcc,
+                    Err(err) => {
+                        return Err(ErrorKind::Header(
+                            err.to_string(),
+                            "Bcc",
+                            mailaddress.to_string(),
+                        )
+                        .into())
+                    }
+                });
             }
         }
+
+        // add "cc"
+        if let Some(cc) = &self.envelope.cc {
+            for mailaddress in cc {
+                msg = msg.cc(match mailaddress.parse() {
+                    Ok(cc) => cc,
+                    Err(err) => {
+                        return Err(ErrorKind::Header(
+                            err.to_string(),
+                            "Cc",
+                            mailaddress.to_string(),
+                        )
+                        .into())
+                    }
+                });
+            }
+        }
+
+        // add "in_reply_to"
+        if let Some(in_reply_to) = &self.envelope.in_reply_to {
+            msg = msg.in_reply_to(match in_reply_to.parse() {
+                Ok(in_reply_to) => in_reply_to,
+                Err(err) => {
+                    return Err(ErrorKind::Header(
+                        err.to_string(),
+                        "In-Reply-To",
+                        in_reply_to.to_string(),
+                    )
+                    .into())
+                }
+            });
+        }
+
+        // add message-id if it exists
+        msg = msg.message_id(self.envelope.message_id.clone());
+
+        // add "reply-to"
+        if let Some(reply_to) = &self.envelope.reply_to {
+            for mailaddress in reply_to {
+                msg = msg.reply_to(match mailaddress.parse() {
+                    Ok(reply_to) => reply_to,
+                    Err(err) => {
+                        return Err(ErrorKind::Header(
+                            err.to_string(),
+                            "Reply-to",
+                            mailaddress.to_string(),
+                        )
+                        .into())
+                    }
+                });
+            }
+        }
+
+        // add "sender"
+        if let Some(sender) = &self.envelope.sender {
+            msg = msg.sender(match sender.parse() {
+                Ok(sender) => sender,
+                Err(err) => {
+                    return Err(
+                        ErrorKind::Header(err.to_string(), "Sender", sender.to_string()).into(),
+                    )
+                }
+            });
+        }
+
+        // add subject
+        if let Some(subject) = &self.envelope.subject {
+            msg = msg.subject(subject);
+        }
+
+        // -----------------------
+        // Body + Attachments
+        // -----------------------
+        // In this part, we'll add the content of the mail. This means the body
+        // and the attachments of the mail.
+
+        // this variable will store all "sections" or attachments of the mail
+        let mut msg_parts = MultiPart::mixed().build();
+
+        // -- Body --
+        // add the body of the mail first
+        let msg_body = SinglePart::plain(self.body.get_content());
+        msg_parts = msg_parts.singlepart(msg_body);
+
+        // -- Attachments --
+        // afterwards, add the rest of the attachments
+        for attachment in self.attachments.iter() {
+            // Get the values of the attachment and convert them to the
+            // Attachment-Struct of lettre.
+            let msg_attachment = lettre_Attachment::new(attachment.filename.clone());
+            let msg_attachment =
+                msg_attachment.body(attachment.body_raw.clone(), attachment.content_type.clone());
+
+            // add the attachment to our attachment-list
+            msg_parts = msg_parts.singlepart(msg_attachment);
+        }
+
+        // Last but not least: Add the attachments to the header of the mail and
+        // return the finished mail!
+        Ok(msg.multipart(msg_parts)
+           .chain_err(|| format!("-- Current Message --\n{}", self))?)
     }
 
-    fn build_tpl(config: &Config, account: &Account, msg_spec: MsgSpec) -> Result<Tpl> {
-        let mut tpl = vec![];
-        Msg::add_from_header(&mut tpl, Some(config.address(account)));
-        Msg::add_in_reply_to_header(&mut tpl, msg_spec.in_reply_to);
-        Msg::add_cc_header(&mut tpl, msg_spec.cc);
-        Msg::add_to_header(&mut tpl, msg_spec.to);
-        Msg::add_subject_header(&mut tpl, msg_spec.subject);
-        Msg::add_content(&mut tpl, msg_spec.default_content);
-        Msg::add_signature(&mut tpl, config, account);
-        Ok(Tpl(tpl.join("\r\n")))
+    /// Returns the uid of the mail.
+    ///
+    /// # Hint
+    /// The uid is only set from the server! So you can only get a `Some(...)`
+    /// from this function, if it's a fetched mail otherwise you'll get `None`.
+    pub fn get_uid(&self) -> Option<u32> {
+        self.uid
+    }
+
+    /// It returns the raw version of the Message. In general it's the structure
+    /// how you get it if you get the data from the fetch. It's the output if
+    /// you read a message with the `--raw` flag like this: `himalaya read
+    /// --raw <UID>`.
+    pub fn get_raw(&self) -> Result<String> {
+
+        let raw_message = String::from_utf8(self.raw.clone()).chain_err(|| {
+            format!(
+                "[{}]: Couldn't get the raw body of the msg/mail.",
+                "Error".red()
+            )
+        })?;
+
+        Ok(raw_message)
     }
 }
 
-struct MsgSpec {
-    in_reply_to: Option<String>,
-    to: Option<Vec<String>>,
-    cc: Option<Vec<String>>,
-    subject: Option<String>,
-    default_content: Option<Vec<String>>,
+// -----------
+// Traits
+// -----------
+impl Default for Msg {
+    fn default() -> Self {
+        Self {
+            attachments: Vec::new(),
+            flags: Flags::new(&[]),
+            envelope: Envelope::default(),
+            body: Body::default(),
+            uid: None,
+            date: None,
+            raw: Vec::new(),
+        }
+    }
 }
 
-impl<'m> Table for Msg<'m> {
+impl fmt::Display for Msg {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(
+            formatter,
+            "{}\n{}",
+            self.envelope.get_header_as_string(),
+            self.body,
+        )
+    }
+}
+
+impl Table for Msg {
     fn head() -> Row {
         Row::new()
             .cell(Cell::new("UID").bold().underline().white())
             .cell(Cell::new("FLAGS").bold().underline().white())
             .cell(Cell::new("SUBJECT").shrinkable().bold().underline().white())
-            .cell(Cell::new("SENDER").bold().underline().white())
+            .cell(Cell::new("FROM").bold().underline().white())
             .cell(Cell::new("DATE").bold().underline().white())
     }
 
     fn row(&self) -> Row {
         let is_seen = !self.flags.contains(&Flag::Seen);
+
+        // The data which will be shown in the row
+        let uid = self.get_uid().unwrap_or(0);
+        let flags = self.flags.to_string();
+        let subject = self.envelope.subject.clone().unwrap_or_default();
+        let mut from = String::new();
+        let date = self.date.clone().unwrap_or(String::new());
+
+        for from_addr in self.envelope.from.iter() {
+            from.push_str(&from_addr);
+        }
+
         Row::new()
-            .cell(Cell::new(&self.uid.to_string()).bold_if(is_seen).red())
-            .cell(Cell::new(&self.flags.to_string()).bold_if(is_seen).white())
-            .cell(
-                Cell::new(&self.subject)
-                    .shrinkable()
-                    .bold_if(is_seen)
-                    .green(),
-            )
-            .cell(Cell::new(&self.sender).bold_if(is_seen).blue())
-            .cell(Cell::new(&self.date).bold_if(is_seen).yellow())
+            .cell(Cell::new(&uid.to_string()).bold_if(is_seen).red())
+            .cell(Cell::new(&flags).bold_if(is_seen).white())
+            .cell(Cell::new(&subject).shrinkable().bold_if(is_seen).green())
+            .cell(Cell::new(&from).bold_if(is_seen).blue())
+            .cell(Cell::new(&date).bold_if(is_seen).yellow())
     }
 }
 
+// -----------
+// From's
+// -----------
+/// Load the data from a fetched mail and store them in the mail-struct.
+/// Please make sure that the fetch includes the following query:
+///
+/// - UID      (optional)
+/// - FLAGS    (optional)
+/// - ENVELOPE (optional)
+/// - INTERNALDATE
+/// - BODY[]   (optional)
+///
+impl TryFrom<&Fetch> for Msg {
+    type Error = Error;
+
+    fn try_from(fetch: &Fetch) -> Result<Msg> {
+        // -----------------
+        // Preparations
+        // -----------------
+        // We're preparing the variables first, which will hold the data of the
+        // fetched mail.
+
+        // Here will be all attachments stored
+        let mut attachments = Vec::new();
+
+        // Get the flags of the mail
+        let flags = Flags::new(fetch.flags());
+
+        // Well, get the data of the envelope from the mail
+        let envelope = Envelope::try_from(fetch.envelope())?;
+
+        // Get the uid of the fetched mail
+        let uid = fetch.uid;
+
+        let date = fetch
+            .internal_date()
+            .map(|date| date.naive_local().to_string());
+
+        // println!("{}", String::from_utf8(fetch.body().unwrap().to_vec()).unwrap());
+        let raw = match fetch.body() {
+            Some(body) => body.to_vec(),
+            None => Vec::new(),
+        };
+
+        // Get the content of the mail. Here we have to look (important!) if
+        // the fetch even includes a body or not, since the `BODY[]` query is
+        // only *optional*!
+        let parsed =
+            // the empty array represents an invalid body, so we can enter the
+            // `Err` arm if the body-query wasn't applied
+            match mailparse::parse_mail(raw.as_slice()) {
+                Ok(parsed) => {
+                    debug!("Fetch has a body to parse.");
+                    Some(parsed)
+                },
+                Err(_) => {
+                    debug!("Fetch hasn't a body to parse.");
+                    None
+                },
+            };
+
+        // ---------------------------------
+        // Storing the information (body)
+        // ---------------------------------
+        let mut body = String::new();
+        if let Some(parsed) = parsed {
+            // Ok, so some mails have their mody wrapped in a multipart, some
+            // don't. This condition hits, if the body isn't in a multipart
+            if parsed.ctype.mimetype == "text/plain" {
+                // Apply the body (if there exists one)
+                if let Ok(parsed_body) = parsed.get_body() {
+                    debug!("Stored the body of the mail.");
+                    body = parsed_body;
+                }
+            }
+
+            // Here we're going through the multi-/subparts of the mail
+            for subpart in &parsed.subparts {
+                // now it might happen, that the body is *in* a multipart, if
+                // that's the case, look, if we've already applied a body
+                // (body.is_empty()) and set it, if needed
+                if body.is_empty() && subpart.ctype.mimetype == "text/plain" {
+                    if let Ok(subpart_body) = subpart.get_body() {
+                        body = subpart_body;
+                    }
+                }
+                // otherise it's a normal attachment, like a PNG file or
+                // something like that
+                else if let Some(attachment) = Attachment::from_parsed_mail(subpart) {
+                    attachments.push(attachment);
+                }
+            }
+        }
+
+        Ok(Self {
+            attachments,
+            flags,
+            envelope,
+            body: Body::from(body),
+            uid,
+            date,
+            raw,
+        })
+    }
+}
+
+impl TryFrom<&str> for Msg {
+    type Error = Error;
+
+    fn try_from(content: &str) -> Result<Self> {
+        let mut msg = Msg::default();
+        msg.parse_from_str(content)?;
+
+        Ok(msg)
+    }
+}
+
+// ==========
 // Msgs
-
+// ==========
+/// A Type-Safety struct which stores a vector of Messages.
 #[derive(Debug, Serialize)]
-pub struct Msgs<'a>(pub Vec<Msg<'a>>);
+pub struct Msgs(pub Vec<Msg>);
 
-impl<'a> From<&'a imap::types::ZeroCopy<Vec<imap::types::Fetch>>> for Msgs<'a> {
-    fn from(fetches: &'a imap::types::ZeroCopy<Vec<imap::types::Fetch>>) -> Self {
-        Self(fetches.iter().rev().map(Msg::from).collect::<Vec<_>>())
-    }
-}
-
-impl Msgs<'_> {
+impl Msgs {
     pub fn new() -> Self {
-        Self(vec![])
+        Self(Vec::new())
     }
 }
 
-impl fmt::Display for Msgs<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "\n{}", Table::render(&self.0))
+// -----------
+// From's
+// -----------
+impl<'mails> TryFrom<&'mails ZeroCopy<Vec<Fetch>>> for Msgs {
+    type Error = Error;
+
+    fn try_from(fetches: &'mails ZeroCopy<Vec<Fetch>>) -> Result<Self> {
+        // the content of the Msgs-struct
+        let mut mails = Vec::new();
+
+        for fetch in fetches.iter().rev() {
+            mails.push(Msg::try_from(fetch)?);
+        }
+
+        Ok(Self(mails))
     }
 }
 
-// Custom bool to int serializer
+// -----------
+// Traits
+// -----------
+impl fmt::Display for Msgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(formatter, "\n{}", Table::render(&self.0))
+    }
+}
 
-fn bool_to_int<S>(t: &bool, s: S) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match t {
-        true => s.serialize_u8(1),
-        false => s.serialize_u8(0),
+#[cfg(test)]
+mod tests {
+    use crate::config::model::Account;
+    use crate::msg::body::Body;
+    use crate::msg::envelope::Envelope;
+    use crate::msg::model::Msg;
+
+    #[test]
+    fn test_new() {
+        // -------------
+        // Accounts
+        // -------------
+        let account1 = Account::new(Some("Soywod"), "clement.douin@posteo.net");
+        let account2 = Account::new(None, "tornax07@gmail.com");
+
+        // ---------------------
+        // Creating message
+        // ---------------------
+        let msg1 = Msg::new(&account1);
+        let msg2 = Msg::new(&account2);
+
+        // ---------------------
+        // Expected outputs
+        // ---------------------
+        let expected_envelope1 = Envelope {
+            from: vec![String::from("Soywod <clement.douin@posteo.net>")],
+            signature: Some(String::from("Account Signature")),
+            ..Envelope::default()
+        };
+
+        let expected_envelope2 = Envelope {
+            from: vec![String::from("tornax07@gmail.com")],
+            signature: Some(String::from("Account Signature")),
+            ..Envelope::default()
+        };
+
+        // ----------
+        // Tests
+        // ----------
+        assert_eq!(msg1.envelope, expected_envelope1);
+        assert_eq!(msg2.envelope, expected_envelope2);
+
+        assert!(msg1.get_raw().unwrap().is_empty());
+        assert!(msg2.get_raw().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_new_with_envelope() {
+        let account = Account::new(Some("Name"), "test@mail.asdf");
+
+        // ------------------
+        // Test-Messages
+        // ------------------
+        let msg_with_custom_from = Msg::new_with_envelope(
+            &account,
+            Envelope {
+                from: vec![String::from("Someone <Else@mail.asdf>")],
+                ..Envelope::default()
+            },
+        );
+
+        let msg_with_custom_signature = Msg::new_with_envelope(
+            &account,
+            Envelope {
+                signature: Some(String::from("Awesome Signature!")),
+                ..Envelope::default()
+            },
+        );
+
+        // -----------------
+        // Expectations
+        // -----------------
+        let expected_with_custom_from = Msg {
+            envelope: Envelope {
+                // the Msg::new_with_envelope function should use the from
+                // address in the envelope struct, not the from address of the
+                // account
+                from: vec![String::from("Someone <Else@mail.asdf>")],
+                signature: Some(String::from("Account Signature")),
+                ..Envelope::default()
+            },
+            // The signature should be added automatically
+            body: Body::from("Account Signature"),
+            ..Msg::default()
+        };
+
+        let expected_with_custom_signature = Msg {
+            envelope: Envelope {
+                from: vec![String::from("Name <test@mail.asdf>")],
+                signature: Some(String::from("Awesome Signature!")),
+                ..Envelope::default()
+            },
+            body: Body::from("Awesome Signature!"),
+            ..Msg::default()
+        };
+
+        // ------------
+        // Testing
+        // ------------
+        assert_eq!(msg_with_custom_from, expected_with_custom_from);
+        assert_eq!(msg_with_custom_signature, expected_with_custom_signature);
+    }
+
+    #[test]
+    fn test_change_to_reply() {
+        // -----------------
+        // Preparations
+        // -----------------
+        let account = Account::new(Some("Name"), "some@address.asdf");
+        let mut msg_normal = Msg::new_with_envelope(
+            &account,
+            Envelope {
+                from: vec!["Boss <someone@boss.asdf>".to_string()],
+                to: vec![
+                    "mail@1.asdf".to_string(),
+                    "mail@2.asdf".to_string(),
+                    "Name <some@address.asdf>".to_string(),
+                ],
+                cc: Some(vec![
+                    "test@testing".to_string(),
+                    "test2@testing".to_string(),
+                ]),
+                message_id: Some("RandomID123".to_string()),
+                reply_to: Some(vec!["Reply@Mail.rofl".to_string()]),
+                subject: Some("Have you heard of himalaya?".to_string()),
+                ..Envelope::default()
+            },
+        );
+
+        msg_normal.body = Body::from(concat![
+            "I can just recommend you to use himalaya!\n",
+            "\n",
+            "Sincereley",
+        ]);
+
+        // -- missing reply to --
+        let mut msg_missing_reply_to = msg_normal.clone();
+        msg_missing_reply_to.envelope = Envelope {
+            reply_to: None,
+            ..msg_missing_reply_to.envelope.clone()
+        };
+
+        // --------------------
+        // Expected output
+        // --------------------
+        let expected_not_reply_all = Msg {
+            envelope: Envelope {
+                from: vec!["Name <some@address.asdf>".to_string()],
+                to: vec!["Reply@Mail.rofl".to_string()],
+                cc: None,
+                in_reply_to: Some("RandomID123".to_string()),
+                subject: Some("Re: Have you heard of himalaya?".to_string()),
+                ..Envelope::default()
+            },
+            body: Body::from(concat![
+                "> I can just recommend you to use himalaya!\n",
+                "> \n",
+                "> Sincereley\n",
+            ]),
+            ..Msg::default()
+        };
+
+        let expected_reply_all = Msg {
+            envelope: Envelope {
+                from: vec!["Name <some@address.asdf>".to_string()],
+                to: vec![
+                    "mail@1.asdf".to_string(),
+                    "mail@2.asdf".to_string(),
+                    "Reply@Mail.rofl".to_string(),
+                ],
+                cc: Some(vec![
+                    "test@testing".to_string(),
+                    "test2@testing".to_string(),
+                ]),
+                in_reply_to: Some("RandomID123".to_string()),
+                subject: Some("Re: Have you heard of himalaya?".to_string()),
+                ..Envelope::default()
+            },
+            body: Body::from(concat![
+                "> I can just recommend you to use himalaya!\n",
+                "> \n",
+                "> Sincereley\n",
+            ]),
+            ..Msg::default()
+        };
+
+        let expected_missing_reply_to = Msg {
+            envelope: Envelope {
+                from: vec!["Name <some@address.asdf>".to_string()],
+                to: vec!["Boss <someone@boss.asdf>".to_string()],
+                cc: None,
+                in_reply_to: Some("RandomID123".to_string()),
+                subject: Some("Re: Have you heard of himalaya?".to_string()),
+                ..Envelope::default()
+            },
+            body: Body::from(concat![
+                "> I can just recommend you to use himalaya!\n",
+                "> \n",
+                "> Sincereley\n",
+            ]),
+            ..Msg::default()
+        };
+
+        let expected_missing_reply_to_reply_all = Msg {
+            envelope: Envelope {
+                from: vec!["Name <some@address.asdf>".to_string()],
+                to: vec![
+                    "mail@1.asdf".to_string(),
+                    "mail@2.asdf".to_string(),
+                    "Boss <someone@boss.asdf>".to_string(),
+                ],
+                cc: Some(vec![
+                    "test@testing".to_string(),
+                    "test2@testing".to_string(),
+                ]),
+                in_reply_to: Some("RandomID123".to_string()),
+                subject: Some("Re: Have you heard of himalaya?".to_string()),
+                ..Envelope::default()
+            },
+            body: Body::from(concat![
+                "> I can just recommend you to use himalaya!\n",
+                "> \n",
+                "> Sincereley\n",
+            ]),
+            ..Msg::default()
+        };
+
+        // ------------
+        // Testing
+        // ------------
+        let mut msg1 = msg_normal.clone();
+        let mut msg2 = msg_normal.clone();
+        let mut msg_missing_reply_to1 = msg_missing_reply_to.clone();
+        let mut msg_missing_reply_to2 = msg_missing_reply_to.clone();
+
+        msg1.change_to_reply(&account, false).unwrap();
+        msg2.change_to_reply(&account, true).unwrap();
+        msg_missing_reply_to1
+            .change_to_reply(&account, false)
+            .unwrap();
+        msg_missing_reply_to2
+            .change_to_reply(&account, true)
+            .unwrap();
+
+        assert_eq!(msg1, expected_not_reply_all);
+        assert_eq!(msg2, expected_reply_all);
+
+        assert_eq!(msg_missing_reply_to1, expected_missing_reply_to);
+        assert_eq!(msg_missing_reply_to2, expected_missing_reply_to_reply_all);
+    }
+
+    #[test]
+    fn test_change_to_forwarding() {
+        // -----------------
+        // Preparations
+        // -----------------
+        let account = Account::new(Some("Name"), "some@address.asdf");
+        let mut msg = Msg::new_with_envelope(
+            &account,
+            Envelope {
+                from: vec![String::from("ThirdPerson <some@mail.asdf>")],
+                subject: Some(String::from("Test subject")),
+                ..Envelope::default()
+            },
+        );
+
+        msg.body = Body::from(concat!["The body text, nice!\n", "Himalaya is nice!",]);
+
+        // ---------------------
+        // Expected Results
+        // ---------------------
+        let expected_msg = Msg {
+            envelope: Envelope {
+                from: vec![String::from("ThirdPerson <some@mail.asdf>")],
+                sender: Some(String::from("Name <some@address.asdf>")),
+                signature: Some(String::from("Account Signature")),
+                subject: Some(String::from("Fwd: Test subject")),
+                ..Envelope::default()
+            },
+            body: Body::from(concat![
+                "\n---------- Forwarded Message ----------\n",
+                "The body text, nice!\n",
+                "Himalaya is nice!\n",
+            ]),
+            ..Msg::default()
+        };
+
+        // ----------
+        // Tests
+        // ----------
+        msg.change_to_forwarding(&account);
+        assert_eq!(msg, expected_msg);
+    }
+
+    #[test]
+    fn test_edit_body() {
+        // -----------------
+        // Preparations
+        // -----------------
+        let account = Account::new(Some("Name"), "some@address.asdf");
+        let mut msg = Msg::new_with_envelope(
+            &account,
+            Envelope {
+                bcc: Some(Vec::new()),
+                cc: Some(Vec::new()),
+                subject: Some(String::new()),
+                ..Envelope::default()
+            },
+        );
+
+        // ---------------------
+        // Expected Results
+        // ---------------------
+        let expected_msg = Msg {
+            envelope: Envelope {
+                from: vec![String::from("Name <some@address.asdf>")],
+                to: vec![String::from("")],
+                // these fields should exist now
+                subject: Some(String::from("")),
+                bcc: Some(vec![String::from("")]),
+                cc: Some(vec![String::from("")]),
+                ..Envelope::default()
+            },
+            body: Body::from("Account Signature\n"),
+            ..Msg::default()
+        };
+
+        // ----------
+        // Tests
+        // ----------
+        msg.edit_body().unwrap();
+        assert_eq!(msg, expected_msg);
+    }
+
+    #[test]
+    fn test_parse_from_str() {
+        use std::collections::HashMap;
+
+        // -----------------
+        // Preparations
+        // -----------------
+        let account = Account::new(Some("Name"), "some@address.asdf");
+        let msg_template = Msg::new(&account);
+
+        let normal_content = concat![
+            "From: Some <user@mail.sf>\n",
+            "Subject: Awesome Subject\n",
+            "Bcc: mail1@rofl.lol,name <rofl@lol.asdf>\n",
+            "To: To <name@mail.rofl>\n",
+            "\n",
+            "Account Signature\n",
+        ];
+
+        let content_with_custom_headers = concat![
+            "From: Some <user@mail.sf>\n",
+            "Subject: Awesome Subject\n",
+            "Bcc: mail1@rofl.lol,name <rofl@lol.asdf>\n",
+            "To: To <name@mail.rofl>\n",
+            "CustomHeader1: Value1\n",
+            "CustomHeader2: Value2\n",
+            "\n",
+            "Account Signature\n",
+        ];
+
+        // ---------------------
+        // Expected outputs
+        // ---------------------
+        let expect = Msg {
+            envelope: Envelope {
+                from: vec![String::from("Some <user@mail.sf>")],
+                subject: Some(String::from("Awesome Subject")),
+                bcc: Some(vec![
+                    String::from("name <rofl@lol.asdf>"),
+                    String::from("mail1@rofl.lol"),
+                ]),
+                to: vec![String::from("To <name@mail.rofl>")],
+                ..Envelope::default()
+            },
+            body: Body::from("Account Signature\n"),
+            ..Msg::default()
+        };
+
+        // -- with custom headers --
+        let mut custom_headers: HashMap<String, Vec<String>> = HashMap::new();
+        custom_headers.insert("CustomHeader1".to_string(), vec!["Value1".to_string()]);
+        custom_headers.insert("CustomHeader2".to_string(), vec!["Value2".to_string()]);
+
+        let expect_custom_header = Msg {
+            envelope: Envelope {
+                from: vec![String::from("Some <user@mail.sf>")],
+                subject: Some(String::from("Awesome Subject")),
+                bcc: Some(vec![
+                    String::from("name <rofl@lol.asdf>"),
+                    String::from("mail1@rofl.lol"),
+                ]),
+                to: vec![String::from("To <name@mail.rofl>")],
+                custom_headers: Some(custom_headers),
+                ..Envelope::default()
+            },
+            body: Body::from("Account Signature\n"),
+            ..Msg::default()
+        };
+
+        // ------------
+        // Testing
+        // ------------
+        let mut msg1 = msg_template.clone();
+        let mut msg2 = msg_template.clone();
+
+        msg1.parse_from_str(normal_content).unwrap();
+        msg2.parse_from_str(content_with_custom_headers).unwrap();
+
+        assert_eq!(msg1, expect);
+        assert_eq!(msg2, expect_custom_header);
     }
 }

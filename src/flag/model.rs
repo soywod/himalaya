@@ -1,43 +1,58 @@
 pub(crate) use imap::types::Flag;
 use serde::ser::{Serialize, SerializeSeq, Serializer};
-use std::ops::Deref;
 
-// Serializable wrapper for `imap::types::Flag`
+use std::borrow::Cow;
+use std::ops::{Deref, DerefMut};
+use std::collections::HashSet;
 
-#[derive(Debug, PartialEq)]
-struct SerializableFlag<'f>(&'f imap::types::Flag<'f>);
+/// Serializable wrapper for `imap::types::Flag`
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct SerializableFlag<'flag>(&'flag imap::types::Flag<'flag>);
 
-impl<'f> Serialize for SerializableFlag<'f> {
+impl<'flag> Serialize for SerializableFlag<'flag> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(match self.0 {
-            Flag::Seen => "Seen",
-            Flag::Answered => "Answered",
-            Flag::Flagged => "Flagged",
-            Flag::Deleted => "Deleted",
-            Flag::Draft => "Draft",
-            Flag::Recent => "Recent",
-            Flag::MayCreate => "MayCreate",
-            Flag::Custom(cow) => cow,
-            _ => "Unknown",
-        })
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(match self.0 {
+                Flag::Seen => "Seen",
+                Flag::Answered => "Answered",
+                Flag::Flagged => "Flagged",
+                Flag::Deleted => "Deleted",
+                Flag::Draft => "Draft",
+                Flag::Recent => "Recent",
+                Flag::MayCreate => "MayCreate",
+                Flag::Custom(cow) => cow,
+                _ => "Unknown",
+            })
+        }
+}
+
+/// This struct type includes all flags which belong to a given mail.
+/// It's used in the [`Msg.flags`] attribute field of the `Msg` struct.
+///
+/// [`Msg.flags`]: struct.Msg.html#structfield.flags
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Flags(HashSet<Flag<'static>>);
+
+impl Flags {
+    pub fn new<'new>(flags: &[imap::types::Flag<'new>]) -> Self {
+        Self(
+            flags
+            .iter()
+            .map(|flag| convert_to_static(flag).unwrap())
+            .collect::<HashSet<Flag<'static>>>(),
+            )
     }
 }
 
-// Flags
-
-#[derive(Debug, PartialEq)]
-pub struct Flags<'f>(&'f [Flag<'f>]);
-
-impl<'f> Flags<'f> {
-    pub fn new(flags: &'f [imap::types::Flag<'f>]) -> Self {
-        Self(flags)
-    }
-}
-
-impl<'f> ToString for Flags<'f> {
+// ===========
+// Traits
+// ===========
+// ------------------
+// Common traits
+// ------------------
+impl ToString for Flags {
     fn to_string(&self) -> String {
         let mut flags = String::new();
 
@@ -63,25 +78,56 @@ impl<'f> ToString for Flags<'f> {
     }
 }
 
-impl<'f> Deref for Flags<'f> {
-    type Target = &'f [Flag<'f>];
+impl Deref for Flags {
+    type Target = HashSet<Flag<'static>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<'f> Serialize for Flags<'f> {
+impl DerefMut for Flags {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Default for Flags {
+    fn default() -> Self {
+        Self(HashSet::new())
+    }
+}
+
+impl Serialize for Flags {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        where
+            S: Serializer,
+        {
+            let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
 
-        for flag in self.0 {
-            seq.serialize_element(&SerializableFlag(flag))?;
+            for flag in &self.0 {
+                seq.serialize_element(&SerializableFlag(flag))?;
+            }
+
+            seq.end()
         }
+}
 
-        seq.end()
+// =====================
+// Helper Functions
+// =====================
+/// HINT: This function is only needed as long this pull request hasn't been
+/// merged yet: https://github.com/jonhoo/rust-imap/pull/206
+fn convert_to_static<'func>(flag: &'func Flag) -> Result<Flag<'static>, ()> {
+    match flag {
+        Flag::Seen => Ok(Flag::Seen),
+        Flag::Answered => Ok(Flag::Answered),
+        Flag::Flagged => Ok(Flag::Flagged),
+        Flag::Deleted => Ok(Flag::Deleted),
+        Flag::Draft => Ok(Flag::Draft),
+        Flag::Recent => Ok(Flag::Recent),
+        Flag::MayCreate => Ok(Flag::MayCreate),
+        Flag::Custom(cow) => Ok(Flag::Custom(Cow::Owned(cow.to_string()))),
+        &_ => Err(())
     }
 }
