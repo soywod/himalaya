@@ -24,8 +24,9 @@ use crate::{
         envelope::{Envelope, normalize_message_id, parse_message_ids},
         flag::{Flag, FlagOp, IanaFlag},
         mailbox::Mailbox,
+        search::query::SearchEmailsQuery,
     },
-    gmail::client::GmailClient,
+    gmail::{client::GmailClient, search},
 };
 
 /// Gmail system label marking an unread message; its absence means seen.
@@ -108,6 +109,74 @@ impl GmailClient {
                 .response;
             envelopes.push(envelope_from(message));
         }
+        Ok(envelopes)
+    }
+
+    /// Searches the `mailbox` label with the shared query: the filter
+    /// half translates into a `messages.list` `q` value, the sort half
+    /// orders the fetched page client-side, Gmail keeping a
+    /// newest-first list order with no server-side sort.
+    pub fn search_envelopes(
+        &mut self,
+        mailbox: &str,
+        query: Option<&SearchEmailsQuery>,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        _with_attachment: bool,
+    ) -> Result<Vec<Envelope>> {
+        let q = match query.and_then(|query| query.filter.as_ref()) {
+            Some(filter) => Some(search::filter_to_q(filter)?),
+            None => None,
+        };
+
+        let label_ids = vec![mailbox.to_string()];
+        let spam_trash = include_spam_trash(mailbox);
+        let skip = page.unwrap_or(1).max(1) - 1;
+
+        let mut page_token: Option<String> = None;
+        for _ in 0..skip {
+            let params = GmailMessagesListParams {
+                q: q.as_deref(),
+                label_ids: &label_ids,
+                max_results: page_size,
+                page_token: page_token.as_deref(),
+                include_spam_trash: spam_trash,
+                ..Default::default()
+            };
+            match self.messages_list(&params)?.response.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => return Ok(Vec::new()),
+            }
+        }
+
+        let params = GmailMessagesListParams {
+            q: q.as_deref(),
+            label_ids: &label_ids,
+            max_results: page_size,
+            page_token: page_token.as_deref(),
+            include_spam_trash: spam_trash,
+            ..Default::default()
+        };
+        let ids: Vec<String> = self
+            .messages_list(&params)?
+            .response
+            .messages
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+
+        let mut envelopes = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let message = self
+                .message_get(id, GmailMessageFormat::Metadata, &[])?
+                .response;
+            envelopes.push(envelope_from(message));
+        }
+
+        if let Some(sorters) = query.and_then(|query| query.sort.as_deref()) {
+            search::sort_envelopes(&mut envelopes, sorters);
+        }
+
         Ok(envelopes)
     }
 

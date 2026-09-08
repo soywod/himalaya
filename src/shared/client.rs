@@ -205,8 +205,8 @@ impl EmailClient {
         }
     }
 
-    /// Searches a mailbox with the shared query, which Gmail and
-    /// Microsoft Graph do not implement.
+    /// Searches a mailbox with the shared query, which Microsoft Graph
+    /// does not implement.
     #[cfg(backend)]
     pub fn search_envelopes(
         &mut self,
@@ -240,7 +240,9 @@ impl EmailClient {
                 client.search_envelopes(mailbox, query, page, page_size, with_attachment)
             }
             #[cfg(feature = "gmail")]
-            BackendClient::Gmail(_) => bail!("Gmail does not support the shared envelope search"),
+            BackendClient::Gmail(client) => {
+                client.search_envelopes(mailbox, query, page, page_size, with_attachment)
+            }
             #[cfg(feature = "msgraph")]
             BackendClient::Msgraph(_) => {
                 bail!("Microsoft Graph does not support the shared envelope search")
