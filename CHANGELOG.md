@@ -85,6 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `message read --seen` and `flag add` reported success and left the message untouched, a Maildir name in `new` having nowhere to carry a flag. The message now moves to `cur` under the same id with its flags in the name, which is the transition every Maildir client performs.
 
+- Fixed the `Bcc:` header of a submitted message being delivered to every recipient ([#747]).
+
+  The SMTP adapter derived the envelope from `To:`, `Cc:` and `Bcc:` and then handed the raw bytes to the transport, so the blind list went out in the DATA: a `message send` of a message carrying five `Bcc:` addresses showed all five to each recipient.
+
+  The header is now removed before submission, the `Bcc:` addresses staying envelope recipients only, as RFC 5322 section 3.6.3 describes.
+
 ## [2.1.0] - 2026-08-16
 
 ### Added
@@ -1253,6 +1259,7 @@ Few major concepts changed:
 [#736]: https://github.com/pimalaya/himalaya/issues/736
 [#738]: https://github.com/pimalaya/himalaya/issues/738
 [#739]: https://github.com/pimalaya/himalaya/issues/739
+[#747]: https://github.com/pimalaya/himalaya/issues/747
 
 [core#1]: https://github.com/pimalaya/core/issues/1
 [core#10]: https://github.com/pimalaya/core/issues/10
